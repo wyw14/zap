@@ -23,6 +23,7 @@ package zapcore
 import (
 	"io"
 	"sync"
+	"time"
 
 	"go.uber.org/multierr"
 )
@@ -118,5 +119,36 @@ func (ws multiWriteSyncer) Sync() error {
 	for _, w := range ws {
 		err = multierr.Append(err, w.Sync())
 	}
+	return err
+}
+
+// InstrumentWriteSyncer wraps ws so that every Sync reports its wall-clock
+// duration and the classification of its error (see ClassifySyncError) to
+// state. Write calls pass straight through to ws and are never blocked or
+// altered by the diagnostics.
+//
+// This is useful for pipelines that wire sinks up manually and want the same
+// flush diagnostics that New installs automatically; combining both for the
+// same sink would double-count flushes.
+//
+// If state is nil, ws is returned unchanged.
+func InstrumentWriteSyncer(ws WriteSyncer, state *ClockState) WriteSyncer {
+	if state == nil {
+		return ws
+	}
+	return &instrumentedWriteSyncer{WriteSyncer: ws, state: state}
+}
+
+type instrumentedWriteSyncer struct {
+	WriteSyncer
+	state *ClockState
+}
+
+func (s *instrumentedWriteSyncer) Sync() error {
+	// Use the wall clock, not any injected clock, so the duration is
+	// meaningful even when the logger's clock is frozen or fake.
+	start := time.Now()
+	err := s.WriteSyncer.Sync()
+	s.state.RecordSync(time.Since(start), err)
 	return err
 }

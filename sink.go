@@ -55,6 +55,36 @@ type nopCloserSink struct{ zapcore.WriteSyncer }
 
 func (nopCloserSink) Close() error { return nil }
 
+// InstrumentSink wraps sink so that its Sync calls report their wall-clock
+// duration and failure classification to state (see zapcore.ClassifySyncError).
+// Writes pass straight through to sink and Close closes sink unchanged;
+// diagnostics use atomic operations only and never block or alter the data
+// flowing through the sink.
+//
+// It is intended for pipelines that assemble sinks manually; loggers built
+// with New collect the same diagnostics automatically, so wrapping their
+// sinks as well would double-count flushes.
+//
+// If state is nil, sink is returned unchanged.
+func InstrumentSink(sink Sink, state *zapcore.ClockState) Sink {
+	if state == nil {
+		return sink
+	}
+	return instrumentedSink{
+		WriteSyncer: zapcore.InstrumentWriteSyncer(sink, state),
+		inner:       sink,
+	}
+}
+
+type instrumentedSink struct {
+	zapcore.WriteSyncer
+	inner Sink
+}
+
+func (s instrumentedSink) Close() error {
+	return s.inner.Close()
+}
+
 type sinkRegistry struct {
 	mu        sync.Mutex
 	factories map[string]func(*url.URL) (Sink, error)          // keyed by scheme

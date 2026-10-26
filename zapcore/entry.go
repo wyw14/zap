@@ -21,7 +21,9 @@
 package zapcore
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"runtime"
 	"strings"
 	"time"
@@ -335,4 +337,184 @@ func (ce *CheckedEntry) After(ent Entry, hook CheckWriteHook) *CheckedEntry {
 	}
 	ce.after = hook
 	return ce
+}
+
+// SyncFailureKind classifies the outcome of a WriteSyncer.Sync (flush) call.
+//
+// Kinds are ordered from least to most specific, so that when a joined error
+// contains several failures the most useful classification wins.
+type SyncFailureKind uint8
+
+const (
+	// SyncOK means the flush succeeded (the error was nil).
+	SyncOK SyncFailureKind = iota
+
+	// SyncFailureFailed is the catch-all for errors that could not be
+	// classified more specifically.
+	SyncFailureFailed
+
+	// SyncFailureUnsupported means flushing is not supported by the
+	// destination, such as ENOTSUP/EINVAL on special files or an invalid
+	// handle (a common case when Syncing standard streams).
+	SyncFailureUnsupported
+
+	// SyncFailureClosed means the destination was closed: the error wraps
+	// fs.ErrClosed (e.g. os.ErrClosed).
+	SyncFailureClosed
+
+	// SyncFailureTemporary means the error reports a recoverable temporary
+	// failure: it implements "Temporary() bool" and reports true.
+	SyncFailureTemporary
+
+	// SyncFailureTimeout means the error reports a timeout: it implements
+	// "Timeout() bool" and reports true.
+	SyncFailureTimeout
+)
+
+// String returns a short, stable name for the classification.
+func (k SyncFailureKind) String() string {
+	switch k {
+	case SyncOK:
+		return "ok"
+	case SyncFailureFailed:
+		return "failed"
+	case SyncFailureUnsupported:
+		return "unsupported"
+	case SyncFailureClosed:
+		return "closed"
+	case SyncFailureTemporary:
+		return "temporary"
+	case SyncFailureTimeout:
+		return "timeout"
+	default:
+		return "unknown"
+	}
+}
+
+// ClassifySyncError classifies the error returned from WriteSyncer.Sync.
+//
+// Joined errors (including errors.Join and go.uber.org/multierr) are
+// inspected individually and the most specific classification found is
+// returned. Classification is best-effort and never changes the error.
+func ClassifySyncError(err error) SyncFailureKind {
+	if err == nil {
+		return SyncOK
+	}
+	kind := SyncFailureFailed
+	walkSyncErrors(err, func(e error) {
+		if k := classifySyncError(e); k > kind {
+			kind = k
+		}
+	})
+	return kind
+}
+
+func classifySyncError(err error) SyncFailureKind {
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return SyncFailureTimeout
+	}
+
+	var temporaryErr interface{ Temporary() bool }
+	if errors.As(err, &temporaryErr) && temporaryErr.Temporary() {
+		return SyncFailureTemporary
+	}
+
+	if errors.Is(err, fs.ErrClosed) {
+		return SyncFailureClosed
+	}
+
+	// Many platforms surface unsupported flushes (ENOTSUP, EINVAL, invalid
+	// handles on special files) as opaque errno strings, so fall back to a
+	// conservative message match.
+	switch msg := strings.ToLower(err.Error()); {
+	case strings.Contains(msg, "not supported"),
+		strings.Contains(msg, "invalid argument"),
+		strings.Contains(msg, "invalid handle"),
+		strings.Contains(msg, "handle is invalid"):
+		return SyncFailureUnsupported
+	}
+
+	return SyncFailureFailed
+}
+
+// walkSyncErrors visits err and every error joined or wrapped beneath it,
+// including errors implementing Unwrap() error or Unwrap() []error.
+func walkSyncErrors(err error, visit func(error)) {
+	seen := make(map[error]bool)
+	var walk func(error)
+	walk = func(e error) {
+		if e == nil || seen[e] {
+			return
+		}
+		seen[e] = true
+		visit(e)
+		switch u := e.(type) {
+		case interface{ Unwrap() []error }:
+			for _, child := range u.Unwrap() {
+				walk(child)
+			}
+		case interface{ Unwrap() error }:
+			walk(u.Unwrap())
+		}
+	}
+	walk(err)
+}
+
+// InstrumentCore wraps core so that every entry it actually writes and every
+// Sync (flush) call it makes are reported to state. Entries are passed to the
+// wrapped core and its encoders unchanged, so timestamp encoding is not
+// affected, and recording uses atomic operations only, so it never blocks
+// log writes.
+//
+// Sync durations are measured with the wall clock rather than any injected
+// Clock, so they remain meaningful with frozen or fake clocks. The error
+// returned by Sync is passed through untouched.
+//
+// If state is nil, core is returned unchanged.
+func InstrumentCore(core Core, state *ClockState) Core {
+	if state == nil {
+		return core
+	}
+	return &clockDiagnosticsCore{Core: core, state: state}
+}
+
+type clockDiagnosticsCore struct {
+	Core
+	state *ClockState
+}
+
+var (
+	_ Core           = (*clockDiagnosticsCore)(nil)
+	_ leveledEnabler = (*clockDiagnosticsCore)(nil)
+)
+
+func (c *clockDiagnosticsCore) Level() Level {
+	return LevelOf(c.Core)
+}
+
+func (c *clockDiagnosticsCore) With(fields []Field) Core {
+	return &clockDiagnosticsCore{Core: c.Core.With(fields), state: c.state}
+}
+
+func (c *clockDiagnosticsCore) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
+	// Let the wrapped core register itself and write first, exactly like
+	// RegisterHooks does; our Write only records diagnostics and must not
+	// write the entry a second time.
+	if downstream := c.Core.Check(ent, ce); downstream != nil {
+		return downstream.AddCore(ent, c)
+	}
+	return ce
+}
+
+func (c *clockDiagnosticsCore) Write(ent Entry, _ []Field) error {
+	c.state.RecordEntry(ent.Time)
+	return nil
+}
+
+func (c *clockDiagnosticsCore) Sync() error {
+	start := time.Now()
+	err := c.Core.Sync()
+	c.state.RecordSync(time.Since(start), err)
+	return err
 }

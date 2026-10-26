@@ -54,6 +54,11 @@ type Logger struct {
 	callerSkip int
 
 	clock zapcore.Clock
+
+	// clockState holds this logger's clock runtime state and flush
+	// diagnostics. It is isolated per New-constructed logger; clones derived
+	// with Named/With/WithOptions share it.
+	clockState *zapcore.ClockState
 }
 
 // New constructs a new Logger from the provided zapcore.Core and Options. If
@@ -75,8 +80,14 @@ func New(core zapcore.Core, options ...Option) *Logger {
 		errorOutput: zapcore.Lock(os.Stderr),
 		addStack:    zapcore.FatalLevel + 1,
 		clock:       zapcore.DefaultClock,
+		clockState:  zapcore.NewClockState(),
 	}
-	return log.WithOptions(options...)
+	log = log.WithOptions(options...)
+	// Install clock/flush diagnostics around the fully configured core.
+	// Recording is lock-free, never alters entries or timestamps, and never
+	// blocks writes.
+	log.core = zapcore.InstrumentCore(log.core, log.clockState)
+	return log
 }
 
 // NewNop returns a no-op Logger. It never writes out logs or internal errors,
@@ -90,6 +101,7 @@ func NewNop() *Logger {
 		errorOutput: zapcore.AddSync(io.Discard),
 		addStack:    zapcore.FatalLevel + 1,
 		clock:       zapcore.DefaultClock,
+		clockState:  zapcore.NewClockState(),
 	}
 }
 
@@ -301,6 +313,21 @@ func (log *Logger) Fatal(msg string, fields ...Field) {
 // entries. Applications should take care to call Sync before exiting.
 func (log *Logger) Sync() error {
 	return log.core.Sync()
+}
+
+// ClockDiagnostics returns a point-in-time snapshot of this logger's clock
+// runtime state and flush diagnostics: the timestamp of the most recently
+// written entry, the wall-clock duration of the most recent Sync call, and
+// how its error (if any) was classified.
+//
+// Collecting diagnostics never changes timestamp encoding and never blocks
+// log writes (it uses atomic operations only). Loggers derived with Named,
+// With or WithOptions share the diagnostics of the logger they derive from,
+// while loggers built with separate New calls are fully isolated. Replacing
+// the clock with WithClock keeps the collected diagnostics and records all
+// subsequent entry times against the new clock.
+func (log *Logger) ClockDiagnostics() zapcore.ClockDiagnostics {
+	return log.clockState.Snapshot()
 }
 
 // Core returns the Logger's underlying zapcore.Core.
