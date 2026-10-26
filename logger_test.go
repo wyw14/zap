@@ -21,8 +21,10 @@
 package zap
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1002,6 +1004,167 @@ func TestLoggerCustomOnFatal(t *testing.T) {
 			})
 		})
 	}
+}
+
+// newDiagLogger wires a logger with the production JSON encoder over the
+// provided WriteSyncer so that flush diagnostics can be exercised without
+// changing the production output format.
+func newDiagLogger(ws zapcore.WriteSyncer, errSink zapcore.WriteSyncer, opts ...Option) *Logger {
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(NewProductionEncoderConfig()),
+		ws,
+		InfoLevel,
+	)
+	return New(core, append([]Option{ErrorOutput(errSink)}, opts...)...)
+}
+
+func TestLoggerSyncFailureCauses(t *testing.T) {
+	stubSinkRegistry(t)
+
+	tests := []struct {
+		name      string
+		scheme    string
+		configure func(*diagMemorySink)
+		wantErr   error
+	}{
+		{
+			name:   "already closed",
+			scheme: "log-closed",
+			configure: func(s *diagMemorySink) {
+				require.NoError(t, s.Close())
+			},
+			wantErr: os.ErrClosed,
+		},
+		{
+			name:   "permission denied",
+			scheme: "log-perm",
+			configure: func(s *diagMemorySink) {
+				s.SetFlushError(fmt.Errorf("flush: permission denied: %w", os.ErrPermission))
+			},
+			wantErr: os.ErrPermission,
+		},
+		{
+			name:   "underlying I/O",
+			scheme: "log-io",
+			configure: func(s *diagMemorySink) {
+				s.SetFlushError(fmt.Errorf("flush: disk unavailable: %w", errDiagSinkIO))
+			},
+			wantErr: errDiagSinkIO,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sink := newDiagMemorySink()
+			tt.configure(sink)
+			registerDiagSink(t, tt.scheme, sink)
+
+			ws, closeAll, err := Open(tt.scheme + "://output")
+			require.NoError(t, err)
+			defer closeAll()
+
+			logger := newDiagLogger(ws, &ztest.Buffer{})
+			err = logger.Sync()
+			require.Error(t, err, "Expected Logger.Sync to surface the flush failure.")
+			assert.True(t, errors.Is(err, tt.wantErr), "Expected Logger.Sync error to wrap %v, got %v.", tt.wantErr, err)
+
+			err = logger.Sugar().Sync()
+			require.Error(t, err, "Expected SugaredLogger.Sync to surface the flush failure.")
+			assert.True(t, errors.Is(err, tt.wantErr), "Expected SugaredLogger.Sync error to wrap %v, got %v.", tt.wantErr, err)
+		})
+	}
+
+	// With several destinations, Sync must retain every underlying cause.
+	permSink := newDiagMemorySink()
+	permSink.SetFlushError(fmt.Errorf("flush: permission denied: %w", os.ErrPermission))
+	registerDiagSink(t, "log-join-perm", permSink)
+	ioSink := newDiagMemorySink()
+	ioSink.SetFlushError(fmt.Errorf("flush: disk unavailable: %w", errDiagSinkIO))
+	registerDiagSink(t, "log-join-io", ioSink)
+
+	ws, closeAll, err := Open("log-join-perm://a", "log-join-io://b")
+	require.NoError(t, err)
+	defer closeAll()
+
+	logger := newDiagLogger(ws, &ztest.Buffer{})
+	err = logger.Sync()
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, os.ErrPermission), "Expected joined Sync error to retain permission cause, got %v.", err)
+	assert.True(t, errors.Is(err, errDiagSinkIO), "Expected joined Sync error to retain I/O cause, got %v.", err)
+	assert.False(t, errors.Is(err, os.ErrClosed), "Joined Sync error should not look like a closed sink, got %v.", err)
+}
+
+func TestLoggerSyncAfterAbnormalClose(t *testing.T) {
+	stubSinkRegistry(t)
+
+	sink := newDiagMemorySink()
+	registerDiagSink(t, "mem", sink)
+
+	ws, closeAll, err := Open("mem://abnormal-close")
+	require.NoError(t, err)
+
+	errSink := &ztest.Buffer{}
+	logger := newDiagLogger(ws, errSink, AddCaller())
+
+	// Before the sink is closed, production output keeps its usual format.
+	logger.Info("hello", String("k", "v"))
+	require.NoError(t, logger.Sync(), "Expected flush before close to succeed.")
+	require.Equal(t, 1, sink.FlushCalls(), "Expected the healthy flush to be recorded.")
+
+	lines := sink.Lines()
+	require.Len(t, lines, 1, "Expected exactly one production log line.")
+	var record map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &record), "Production output must remain valid JSON.")
+	assert.Equal(t, "info", record["level"], "Production level encoding changed.")
+	assert.Equal(t, "hello", record["msg"], "Production message encoding changed.")
+	assert.Equal(t, "v", record["k"], "Production field encoding changed.")
+	caller, _ := record["caller"].(string)
+	assert.Contains(t, caller, "logger_test.go:", "Production caller encoding changed.")
+	ts, ok := record["ts"].(float64)
+	require.True(t, ok && ts > 0, "Production timestamp encoding changed: %v.", record["ts"])
+
+	// Abnormally close the destination while the logger is still alive.
+	closeAll()
+	assert.True(t, sink.Closed(), "Expected the sink to be closed.")
+
+	err = logger.Sync()
+	require.Error(t, err, "Expected Sync to fail after the sink is closed.")
+	assert.True(t, errors.Is(err, os.ErrClosed), "Expected Sync failure to classify as already closed, got %v.", err)
+
+	// Logging after the abnormal close routes the write failure to the error
+	// sink instead of dropping it silently.
+	logger.Info("after close")
+	assert.Contains(
+		t,
+		errSink.Stripped(),
+		"already closed",
+		"Expected the post-close write failure on the error sink, got %q.",
+		errSink.Stripped(),
+	)
+}
+
+func TestLoggerSyncConcurrent(t *testing.T) {
+	stubSinkRegistry(t)
+
+	sink := newDiagMemorySink()
+	registerDiagSink(t, "mem", sink)
+
+	ws, closeAll, err := Open("mem://sync-concurrent")
+	require.NoError(t, err)
+	defer closeAll()
+
+	logger := newDiagLogger(ws, &ztest.Buffer{})
+
+	const goroutines, iterations = 16, 50
+	var wg sync.WaitGroup
+	runConcurrently(goroutines, iterations, &wg, func() {
+		logger.Info("concurrent")
+		assert.NoError(t, logger.Sync(), "Concurrent flushes on an open sink should succeed.")
+	})
+	wg.Wait()
+
+	assert.Equal(t, goroutines*iterations, sink.FlushCalls(), "Expected every concurrent Sync to reach the sink.")
+	assert.Len(t, sink.Lines(), goroutines*iterations, "Expected every concurrent log line to be recorded.")
 }
 
 type customWriteHook struct {

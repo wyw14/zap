@@ -21,6 +21,7 @@
 package observer_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -265,5 +266,100 @@ func TestFilters(t *testing.T) {
 	for _, tt := range tests {
 		got := tt.filtered.AllUntimed()
 		assert.Equal(t, tt.want, got, tt.msg)
+	}
+}
+
+func TestFilterCaller(t *testing.T) {
+	callerOne := zapcore.EntryCaller{Defined: true, PC: 1, File: "foo/bar.go", Line: 42, Function: "foo.Bar"}
+	callerTwo := zapcore.EntryCaller{Defined: true, PC: 2, File: "foo/baz.go", Line: 7, Function: "foo.Baz"}
+
+	entries := []LoggedEntry{
+		{Entry: zapcore.Entry{Level: zap.InfoLevel, Message: "no caller"}, Context: []zapcore.Field{}},
+		{Entry: zapcore.Entry{Level: zap.InfoLevel, Message: "from one", Caller: callerOne}, Context: []zapcore.Field{}},
+		{Entry: zapcore.Entry{Level: zap.WarnLevel, Message: "from two", Caller: callerTwo}, Context: []zapcore.Field{}},
+		{Entry: zapcore.Entry{Level: zap.ErrorLevel, Message: "from one again", Caller: callerOne}, Context: []zapcore.Field{}},
+	}
+
+	core, logs := New(zap.DebugLevel)
+	for _, entry := range entries {
+		require.NoError(t, core.Write(entry.Entry, entry.Context), "Unexpected error writing log entry.")
+	}
+
+	assert.Equal(
+		t,
+		[]LoggedEntry{entries[1], entries[3]},
+		logs.FilterCaller(callerOne).AllUntimed(),
+		"Expected every entry from callerOne.",
+	)
+	assert.Equal(t, entries[2:3], logs.FilterCaller(callerTwo).AllUntimed(), "Expected only entries from callerTwo.")
+
+	// Caller filtering composes with level filtering.
+	assert.Equal(
+		t,
+		entries[3:4],
+		logs.FilterLevelExact(zap.ErrorLevel).FilterCaller(callerOne).AllUntimed(),
+		"Expected level and caller filters to compose.",
+	)
+
+	// An undefined caller only matches entries whose caller is also undefined.
+	undefined := zapcore.EntryCaller{}
+	assert.Equal(t, entries[0:1], logs.FilterCaller(undefined).AllUntimed(), "Expected only entries without a caller.")
+
+	// An unrelated defined caller matches nothing.
+	other := zapcore.EntryCaller{Defined: true, PC: 99, File: "other.go", Line: 1}
+	assert.Empty(t, logs.FilterCaller(other).All(), "Expected no entries from an unknown caller.")
+}
+
+func TestObserverConcurrent(t *testing.T) {
+	const goroutines, iterations = 16, 200
+
+	core, logs := New(zap.DebugLevel)
+	logger := zap.New(core)
+
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(2)
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = logs.FilterLevelExact(zap.InfoLevel).Len()
+			}
+		}
+	}()
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = logs.FilterFieldKey("i").All()
+			}
+		}
+	}()
+
+	var writers sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		writers.Add(1)
+		go func(g int) {
+			defer writers.Done()
+			for i := 0; i < iterations; i++ {
+				logger.Info("concurrent", zap.Int("g", g), zap.Int("i", i))
+			}
+		}(g)
+	}
+	writers.Wait()
+	close(stop)
+	readers.Wait()
+
+	all := logs.All()
+	require.Equal(t, goroutines*iterations, len(all), "Expected every concurrent write to be observed.")
+	for _, entry := range all {
+		assert.Equal(t, zap.InfoLevel, entry.Level, "Unexpected level on observed entry.")
+		assert.Equal(t, 2, len(entry.Context), "Expected both context fields on every observed entry.")
 	}
 }

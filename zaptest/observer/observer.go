@@ -129,6 +129,14 @@ func (o *ObservedLogs) FilterFieldKey(key string) *ObservedLogs {
 	})
 }
 
+// FilterCaller filters entries to those logged from exactly the given caller.
+// Entries without a defined caller are never matched by a defined caller.
+func (o *ObservedLogs) FilterCaller(caller zapcore.EntryCaller) *ObservedLogs {
+	return o.Filter(func(e LoggedEntry) bool {
+		return e.Caller == caller
+	})
+}
+
 // Filter returns a copy of this ObservedLogs containing only those entries
 // for which the provided function returns true.
 func (o *ObservedLogs) Filter(keep func(LoggedEntry) bool) *ObservedLogs {
