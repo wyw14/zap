@@ -20,6 +20,8 @@
 
 package zapcore
 
+import "time"
+
 // Core is a minimal, fast logger interface. It's designed for library authors
 // to wrap in a more user-friendly API.
 type Core interface {
@@ -42,6 +44,31 @@ type Core interface {
 	Write(Entry, []Field) error
 	// Sync flushes buffered logs (if any).
 	Sync() error
+}
+
+// SamplerReporter is implemented by Cores that sample incoming entries and
+// can report on their runtime behavior. The Core returned by
+// [NewSamplerWithOptions] implements this interface; callers can discover it
+// with a type assertion.
+type SamplerReporter interface {
+	// SamplerStats returns a point-in-time snapshot of per-level runtime
+	// counters: entries accepted by the sampler, entries dropped by the
+	// sampler, and sampling-window resets.
+	SamplerStats() []SamplerLevelStats
+
+	// SamplerConfig returns a point-in-time snapshot of the active sampling
+	// configuration (window, initial burst, and steady-state stride).
+	SamplerConfig() SamplerConfigSnapshot
+
+	// SamplerSnapshot returns the active configuration together with the
+	// per-level runtime counters.
+	SamplerSnapshot() SamplerSnapshot
+
+	// UpdateSamplerConfig atomically replaces the sampling parameters:
+	// tick is the sampling window, first is the per-window burst, and
+	// thereafter is the steady-state stride. Concurrent logging observes
+	// either the previous or the new configuration, never a torn mix.
+	UpdateSamplerConfig(tick time.Duration, first, thereafter int)
 }
 
 type nopCore struct{}

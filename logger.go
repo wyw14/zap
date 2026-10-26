@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"go.uber.org/zap/internal/bufferpool"
 	"go.uber.org/zap/internal/stacktrace"
@@ -306,6 +307,39 @@ func (log *Logger) Sync() error {
 // Core returns the Logger's underlying zapcore.Core.
 func (log *Logger) Core() zapcore.Core {
 	return log.core
+}
+
+// SamplerSnapshot returns a point-in-time snapshot of the sampling Core's
+// active configuration and per-level runtime statistics (accepted entries,
+// dropped entries, and sampling-window resets).
+//
+// The boolean is false if the Logger's Core does not support sampling
+// statistics (see [zapcore.SamplerReporter]); in that case the returned
+// snapshot is the zero value.
+func (log *Logger) SamplerSnapshot() (zapcore.SamplerSnapshot, bool) {
+	reporter, ok := log.core.(zapcore.SamplerReporter)
+	if !ok {
+		return zapcore.SamplerSnapshot{}, false
+	}
+	return reporter.SamplerSnapshot(), true
+}
+
+// UpdateSamplerConfig atomically updates the sampling parameters of the
+// Logger's sampling Core: tick is the sampling window, first is the
+// per-window burst, and thereafter is the steady-state stride.
+//
+// Concurrent logging observes either the previous or the new configuration
+// in full, never a torn mix.
+//
+// It returns false (and changes nothing) if the Logger's Core does not
+// support runtime reconfiguration.
+func (log *Logger) UpdateSamplerConfig(tick time.Duration, first, thereafter int) bool {
+	reporter, ok := log.core.(zapcore.SamplerReporter)
+	if !ok {
+		return false
+	}
+	reporter.UpdateSamplerConfig(tick, first, thereafter)
+	return true
 }
 
 // Name returns the Logger's underlying name,

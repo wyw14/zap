@@ -61,11 +61,17 @@ func fnv32a(s string) uint32 {
 	return hash
 }
 
-func (c *counter) IncCheckReset(t time.Time, tick time.Duration) uint64 {
+// IncCheckReset increments the counter for the current sampling window,
+// resetting it (and the window boundary) if the window has elapsed.
+//
+// It returns the post-increment count and whether this call performed the
+// window reset. At most one concurrent caller reports a reset for a given
+// window transition.
+func (c *counter) IncCheckReset(t time.Time, tick time.Duration) (uint64, bool) {
 	tn := t.UnixNano()
 	resetAfter := c.resetAt.Load()
 	if resetAfter > tn {
-		return c.counter.Add(1)
+		return c.counter.Add(1), false
 	}
 
 	c.counter.Store(1)
@@ -74,10 +80,10 @@ func (c *counter) IncCheckReset(t time.Time, tick time.Duration) uint64 {
 	if !c.resetAt.CompareAndSwap(resetAfter, newResetAfter) {
 		// We raced with another goroutine trying to reset, and it also reset
 		// the counter to 1, so we need to reincrement the counter.
-		return c.counter.Add(1)
+		return c.counter.Add(1), false
 	}
 
-	return 1
+	return 1, true
 }
 
 // SamplingDecision is a decision represented as a bit field made by sampler.
@@ -90,6 +96,83 @@ const (
 	// LogSampled indicates that the Sampler sampled a log entry.
 	LogSampled
 )
+
+// SamplerLevelStats is a point-in-time snapshot of a Sampler's runtime
+// counters for a single log level.
+type SamplerLevelStats struct {
+	// Level these counters belong to.
+	Level Level
+	// Accepted is the number of entries at this level the sampler let
+	// through.
+	Accepted uint64
+	// Dropped is the number of entries at this level the sampler dropped.
+	Dropped uint64
+	// Resets is the number of times a sampling window was reset at this
+	// level, i.e. how many times the first entry of a new tick window was
+	// observed.
+	Resets uint64
+}
+
+// SamplerConfigSnapshot is a point-in-time snapshot of a Sampler's
+// configuration.
+type SamplerConfigSnapshot struct {
+	// Tick is the length of each sampling window.
+	Tick time.Duration
+	// First is the number of entries with a given level and message that
+	// are logged per window before sampling kicks in.
+	First uint64
+	// Thereafter is the stride at which entries are logged after First; a
+	// zero value drops every entry after First.
+	Thereafter uint64
+}
+
+// SamplerSnapshot bundles a Sampler's configuration snapshot with its
+// per-level runtime statistics.
+type SamplerSnapshot struct {
+	Config SamplerConfigSnapshot
+	Stats  []SamplerLevelStats
+}
+
+// samplerConfig is the immutable sampling configuration stored behind an
+// atomic pointer, so that parameter updates are published atomically:
+// concurrent Check calls observe either the previous configuration or the
+// new one in full, never a mix.
+type samplerConfig struct {
+	tick       time.Duration
+	first      uint64
+	thereafter uint64
+}
+
+// samplerStats holds the per-level runtime counters. The fixed-size arrays
+// of atomics must never be copied, so samplers share a pointer to it.
+type samplerStats struct {
+	accepted [_numLevels]atomic.Uint64
+	dropped  [_numLevels]atomic.Uint64
+	resets   [_numLevels]atomic.Uint64
+}
+
+// samplerState bundles everything shared between a sampler and the Cores
+// derived from it with With: the per-message counters, the runtime
+// statistics, and the active configuration. Separate samplers never share
+// state, so their statistics can't be mixed by concurrent logging.
+type samplerState struct {
+	counts *counters
+	stats  *samplerStats
+	config atomic.Pointer[samplerConfig]
+}
+
+func newSamplerState(tick time.Duration, first, thereafter int) *samplerState {
+	st := &samplerState{
+		counts: newCounters(),
+		stats:  &samplerStats{},
+	}
+	st.config.Store(&samplerConfig{
+		tick:       tick,
+		first:      uint64(first),
+		thereafter: uint64(thereafter),
+	})
+	return st
+}
 
 // optionFunc wraps a func so it satisfies the SamplerOption interface.
 type optionFunc func(*sampler)
@@ -146,17 +229,19 @@ func SamplerHook(hook func(entry Entry, dec SamplingDecision)) SamplerOption {
 // Sampler can be configured to report sampling decisions with the SamplerHook
 // option.
 //
+// Beyond SamplerHook, the returned Core implements [SamplerReporter], which
+// exposes per-level runtime counters (accepted entries, dropped entries, and
+// sampling-window resets), a configuration snapshot, and atomic runtime
+// reconfiguration via UpdateSamplerConfig.
+//
 // Keep in mind that Zap's sampling implementation is optimized for speed over
 // absolute precision; under load, each tick may be slightly over- or
 // under-sampled.
 func NewSamplerWithOptions(core Core, tick time.Duration, first, thereafter int, opts ...SamplerOption) Core {
 	s := &sampler{
-		Core:       core,
-		tick:       tick,
-		counts:     newCounters(),
-		first:      uint64(first),
-		thereafter: uint64(thereafter),
-		hook:       nopSamplingHook,
+		Core:  core,
+		state: newSamplerState(tick, first, thereafter),
+		hook:  nopSamplingHook,
 	}
 	for _, opt := range opts {
 		opt.apply(s)
@@ -168,15 +253,14 @@ func NewSamplerWithOptions(core Core, tick time.Duration, first, thereafter int,
 type sampler struct {
 	Core
 
-	counts            *counters
-	tick              time.Duration
-	first, thereafter uint64
-	hook              func(Entry, SamplingDecision)
+	state *samplerState
+	hook  func(Entry, SamplingDecision)
 }
 
 var (
-	_ Core           = (*sampler)(nil)
-	_ leveledEnabler = (*sampler)(nil)
+	_ Core            = (*sampler)(nil)
+	_ leveledEnabler  = (*sampler)(nil)
+	_ SamplerReporter = (*sampler)(nil)
 )
 
 // NewSampler creates a Core that samples incoming entries, which
@@ -202,13 +286,63 @@ func (s *sampler) Level() Level {
 
 func (s *sampler) With(fields []Field) Core {
 	return &sampler{
-		Core:       s.Core.With(fields),
-		tick:       s.tick,
-		counts:     s.counts,
-		first:      s.first,
-		thereafter: s.thereafter,
-		hook:       s.hook,
+		Core:  s.Core.With(fields),
+		state: s.state,
+		hook:  s.hook,
 	}
+}
+
+// SamplerStats returns a point-in-time snapshot of the sampler's runtime
+// counters, ordered from DebugLevel to FatalLevel. Cores derived with With
+// report the same counters as the sampler they came from.
+func (s *sampler) SamplerStats() []SamplerLevelStats {
+	stats := make([]SamplerLevelStats, _numLevels)
+	for i := 0; i < int(_numLevels); i++ {
+		lvl := Level(int(_minLevel) + i)
+		idx := lvl - _minLevel
+		stats[i] = SamplerLevelStats{
+			Level:    lvl,
+			Accepted: s.state.stats.accepted[idx].Load(),
+			Dropped:  s.state.stats.dropped[idx].Load(),
+			Resets:   s.state.stats.resets[idx].Load(),
+		}
+	}
+	return stats
+}
+
+// SamplerConfig returns a point-in-time snapshot of the sampler's active
+// configuration.
+func (s *sampler) SamplerConfig() SamplerConfigSnapshot {
+	cfg := s.state.config.Load()
+	return SamplerConfigSnapshot{
+		Tick:       cfg.tick,
+		First:      cfg.first,
+		Thereafter: cfg.thereafter,
+	}
+}
+
+// SamplerSnapshot returns the sampler's active configuration together with
+// its per-level runtime counters. Each value is read atomically.
+func (s *sampler) SamplerSnapshot() SamplerSnapshot {
+	return SamplerSnapshot{
+		Config: s.SamplerConfig(),
+		Stats:  s.SamplerStats(),
+	}
+}
+
+// UpdateSamplerConfig atomically replaces the sampler's sampling parameters:
+// tick is the sampling window, first is the per-window burst, and thereafter
+// is the steady-state stride (zero drops everything after the burst).
+//
+// Concurrent Check calls observe either the previous configuration or the
+// new one in full, never a torn mix. The update applies to every Core
+// derived from this sampler with With.
+func (s *sampler) UpdateSamplerConfig(tick time.Duration, first, thereafter int) {
+	s.state.config.Store(&samplerConfig{
+		tick:       tick,
+		first:      uint64(first),
+		thereafter: uint64(thereafter),
+	})
 }
 
 func (s *sampler) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
@@ -217,12 +351,19 @@ func (s *sampler) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
 	}
 
 	if ent.Level >= _minLevel && ent.Level <= _maxLevel {
-		counter := s.counts.get(ent.Level, ent.Message)
-		n := counter.IncCheckReset(ent.Time, s.tick)
-		if n > s.first && (s.thereafter == 0 || (n-s.first)%s.thereafter != 0) {
+		cfg := s.state.config.Load()
+		counter := s.state.counts.get(ent.Level, ent.Message)
+		n, reset := counter.IncCheckReset(ent.Time, cfg.tick)
+		idx := ent.Level - _minLevel
+		if reset {
+			s.state.stats.resets[idx].Add(1)
+		}
+		if n > cfg.first && (cfg.thereafter == 0 || (n-cfg.first)%cfg.thereafter != 0) {
+			s.state.stats.dropped[idx].Add(1)
 			s.hook(ent, LogDropped)
 			return ce
 		}
+		s.state.stats.accepted[idx].Add(1)
 		s.hook(ent, LogSampled)
 	}
 	return s.Core.Check(ent, ce)

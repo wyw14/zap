@@ -27,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap/internal/exit"
 	"go.uber.org/zap/internal/ztest"
@@ -1058,4 +1059,232 @@ func infoLog(logger *Logger, msg string, fields ...Field) {
 
 func infoLogSugared(logger *SugaredLogger, args ...interface{}) {
 	logger.Info(args...)
+}
+
+func loggerLevelStats(
+	t *testing.T,
+	snap zapcore.SamplerSnapshot,
+	lvl zapcore.Level,
+) zapcore.SamplerLevelStats {
+	t.Helper()
+	for _, s := range snap.Stats {
+		if s.Level == lvl {
+			return s
+		}
+	}
+	t.Fatalf("level %v not found in sampler snapshot", lvl)
+	return zapcore.SamplerLevelStats{}
+}
+
+func newSamplerLogger(
+	enab zapcore.LevelEnabler,
+	tick time.Duration,
+	first, thereafter int,
+	opts ...Option,
+) (*Logger, *observer.ObservedLogs) {
+	core, logs := observer.New(enab)
+	sampled := zapcore.NewSamplerWithOptions(core, tick, first, thereafter)
+	return New(sampled, opts...), logs
+}
+
+func TestLoggerSamplerSnapshot(t *testing.T) {
+	log, logs := newSamplerLogger(zapcore.DebugLevel, time.Minute, 2, 0)
+
+	snap, ok := log.SamplerSnapshot()
+	require.True(t, ok, "sampling logger must report a snapshot")
+	assert.Equal(t, zapcore.SamplerConfigSnapshot{
+		Tick: time.Minute, First: 2, Thereafter: 0,
+	}, snap.Config, "unexpected config snapshot")
+
+	// Non-sampling loggers don't support the sampler snapshot.
+	_, ok = NewNop().SamplerSnapshot()
+	assert.False(t, ok, "nop logger must not report sampler stats")
+	assert.False(t, NewNop().UpdateSamplerConfig(time.Second, 1, 1),
+		"nop logger must not support sampler reconfiguration")
+
+	// 5 info attempts in one window: 2 accepted, 3 dropped, 1 reset.
+	for i := 0; i < 5; i++ {
+		log.Info("burst")
+	}
+	snap, ok = log.SamplerSnapshot()
+	require.True(t, ok)
+	assert.Equal(t, zapcore.SamplerLevelStats{
+		Level: zapcore.InfoLevel, Accepted: 2, Dropped: 3, Resets: 1,
+	}, loggerLevelStats(t, snap, zapcore.InfoLevel))
+	assert.Len(t, logs.TakeAll(), 2, "unexpected number of logs written")
+
+	// Dynamic reconfiguration is reflected by the next snapshot.
+	require.True(t, log.UpdateSamplerConfig(time.Hour, 9, 4))
+	snap, _ = log.SamplerSnapshot()
+	assert.Equal(t, zapcore.SamplerConfigSnapshot{
+		Tick: time.Hour, First: 9, Thereafter: 4,
+	}, snap.Config, "config update must be visible atomically")
+}
+
+// fireDPanic invokes DPanic on the logger and reports whether it panicked,
+// recovering so the caller can continue the test.
+func fireDPanic(log *Logger) (panicked bool) {
+	defer func() {
+		panicked = recover() != nil
+	}()
+	log.DPanic("dpanic")
+	return false
+}
+
+func TestLoggerSamplerDPanic(t *testing.T) {
+	t.Run("production mode", func(t *testing.T) {
+		// In production, DPanic is sampled like every other level and never
+		// panics.
+		log, logs := newSamplerLogger(zapcore.DebugLevel, time.Minute, 2, 0)
+
+		assert.NotPanics(t, func() {
+			for i := 0; i < 5; i++ {
+				log.DPanic("dpanic")
+			}
+		})
+
+		snap, ok := log.SamplerSnapshot()
+		require.True(t, ok)
+		assert.Equal(t, zapcore.SamplerLevelStats{
+			Level: zapcore.DPanicLevel, Accepted: 2, Dropped: 3, Resets: 1,
+		}, loggerLevelStats(t, snap, zapcore.DPanicLevel))
+
+		written := logs.TakeAll()
+		assert.Len(t, written, 2)
+		for _, ent := range written {
+			assert.Equal(t, zapcore.DPanicLevel, ent.Level)
+		}
+	})
+
+	t.Run("development mode", func(t *testing.T) {
+		// In development, DPanic panics even when the sampler drops the
+		// entry: the drop is still counted, but nothing is written.
+		log, logs := newSamplerLogger(
+			zapcore.DebugLevel, time.Minute, 1, 1000, Development(),
+		)
+
+		for i := 0; i < 5; i++ {
+			assert.True(t, fireDPanic(log),
+				"DPanic must panic in development even when sampled away")
+		}
+
+		snap, ok := log.SamplerSnapshot()
+		require.True(t, ok)
+		assert.Equal(t, zapcore.SamplerLevelStats{
+			Level: zapcore.DPanicLevel, Accepted: 1, Dropped: 4, Resets: 1,
+		}, loggerLevelStats(t, snap, zapcore.DPanicLevel))
+
+		written := logs.TakeAll()
+		assert.Len(t, written, 1, "dropped DPanic entries must not be written")
+		assert.Equal(t, zapcore.DPanicLevel, written[0].Level)
+	})
+}
+
+func TestLoggerSamplerReplaceCore(t *testing.T) {
+	logA, logsA := newSamplerLogger(zapcore.DebugLevel, time.Minute, 2, 0)
+	for i := 0; i < 5; i++ {
+		logA.Info("a")
+	}
+	snapA, ok := logA.SamplerSnapshot()
+	require.True(t, ok)
+	assert.Equal(t, zapcore.SamplerLevelStats{
+		Level: zapcore.InfoLevel, Accepted: 2, Dropped: 3, Resets: 1,
+	}, loggerLevelStats(t, snapA, zapcore.InfoLevel))
+
+	coreB, logsB := observer.New(zapcore.DebugLevel)
+	// Replace the whole core with a fresh sampler around a fresh core.
+	logB := logA.WithOptions(WrapCore(func(_ zapcore.Core) zapcore.Core {
+		return zapcore.NewSamplerWithOptions(coreB, time.Minute, 2, 0)
+	}))
+	for i := 0; i < 3; i++ {
+		logB.Info("b")
+	}
+
+	snapB, ok := logB.SamplerSnapshot()
+	require.True(t, ok)
+	assert.Equal(t, zapcore.SamplerLevelStats{
+		Level: zapcore.InfoLevel, Accepted: 2, Dropped: 1, Resets: 1,
+	}, loggerLevelStats(t, snapB, zapcore.InfoLevel),
+		"replaced core must keep its own counters")
+
+	// The original logger must be unaffected by the replacement.
+	snapA, _ = logA.SamplerSnapshot()
+	assert.Equal(t, zapcore.SamplerLevelStats{
+		Level: zapcore.InfoLevel, Accepted: 2, Dropped: 3, Resets: 1,
+	}, loggerLevelStats(t, snapA, zapcore.InfoLevel),
+		"replacing a core must not mix counters into the old logger")
+	assert.Len(t, logsA.TakeAll(), 2)
+	assert.Len(t, logsB.TakeAll(), 2)
+
+	// Runtime reconfiguration of one logger must not touch the other.
+	require.True(t, logB.UpdateSamplerConfig(time.Hour, 9, 9))
+	snapA, _ = logA.SamplerSnapshot()
+	snapB, _ = logB.SamplerSnapshot()
+	assert.Equal(t, time.Minute, snapA.Config.Tick, "logA config must not change")
+	assert.Equal(t, uint64(2), snapA.Config.First)
+	assert.Equal(t, time.Hour, snapB.Config.Tick, "logB config change must apply")
+	assert.Equal(t, uint64(9), snapB.Config.First)
+
+	// Replacing with a non-sampling core removes the reporting capability.
+	coreC, _ := observer.New(zapcore.DebugLevel)
+	logC := logA.WithOptions(WrapCore(func(_ zapcore.Core) zapcore.Core {
+		return coreC
+	}))
+	_, ok = logC.SamplerSnapshot()
+	assert.False(t, ok, "non-sampling replacement must not report sampler stats")
+	assert.False(t, logC.UpdateSamplerConfig(time.Second, 1, 1))
+}
+
+func TestLoggerSamplerConcurrentIsolation(t *testing.T) {
+	// Two loggers, two independent sampling cores. Concurrent logging must
+	// attribute every entry to the logger that emitted it.
+	logA, logsA := newSamplerLogger(zapcore.DebugLevel, time.Hour, 1_000_000, 1)
+	logB, logsB := newSamplerLogger(zapcore.DebugLevel, time.Hour, 1_000_000, 1)
+
+	const (
+		goroutines = 8
+		iterations = 200
+		total      = goroutines * iterations
+	)
+
+	var wg sync.WaitGroup
+	runConcurrently(goroutines, iterations, &wg, func() {
+		logA.Info("alpha")
+	})
+	runConcurrently(goroutines, iterations, &wg, func() {
+		logB.Warn("beta")
+	})
+	wg.Wait()
+
+	snapA, ok := logA.SamplerSnapshot()
+	require.True(t, ok)
+	snapB, ok := logB.SamplerSnapshot()
+	require.True(t, ok)
+
+	assert.Equal(t, zapcore.SamplerLevelStats{
+		Level: zapcore.InfoLevel, Accepted: total, Dropped: 0, Resets: 1,
+	}, loggerLevelStats(t, snapA, zapcore.InfoLevel),
+		"logA info counters must only count logA's info logs")
+	assert.Equal(t, zapcore.SamplerLevelStats{
+		Level: zapcore.WarnLevel, Accepted: total, Dropped: 0, Resets: 1,
+	}, loggerLevelStats(t, snapB, zapcore.WarnLevel),
+		"logB warn counters must only count logB's warn logs")
+
+	// No level of either sampler may have picked up the other logger's
+	// traffic.
+	for _, s := range snapA.Stats {
+		if s.Level != zapcore.InfoLevel {
+			assert.Equal(t, zapcore.SamplerLevelStats{Level: s.Level}, s,
+				"logA must have no counters at %v", s.Level)
+		}
+	}
+	for _, s := range snapB.Stats {
+		if s.Level != zapcore.WarnLevel {
+			assert.Equal(t, zapcore.SamplerLevelStats{Level: s.Level}, s,
+				"logB must have no counters at %v", s.Level)
+		}
+	}
+
+	assert.Equal(t, total, logsA.Len(), "unexpected number of logs from logA")
+	assert.Equal(t, total, logsB.Len(), "unexpected number of logs from logB")
 }
